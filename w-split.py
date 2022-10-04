@@ -1,5 +1,7 @@
 # -*- coding:utf-8 -*-
-import os, sys, shutil, subprocess, tempfile, re, time, unicodedata, configparser, glob
+from hashlib import new
+import os, sys, shutil, subprocess, tempfile, re, time, unicodedata, configparser
+from pathlib import Path
 from concurrent import futures
 from PIL import Image   # pillow インストール必要
 import pillow_avif      # pillow-avif-plugin インストール必要
@@ -7,6 +9,7 @@ import cv2              # opencv-python インストール必要
 import numpy as np      # numpy インストール必要
 from send2trash import send2trash # send2trash インストール必要
 from winsort import winsort # 自作モジュール導入必要
+from damemoji import damemoji # 自作モジュール導入必要
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -14,55 +17,52 @@ logging.basicConfig(level=logging.INFO)
 # 並行処理のための、トリミング関数
 def page_crop(p):
     logging.debug('start_proc')
-    with Image.open(os.path.join(tpath, p)) as img:
+    with Image.open(tpath.joinpath(p)) as img:
         # トリミング値の計算
         width, height = img.size
         br = ((width/2), 0, (width*(1-rlTrim)), height)  # 右ページ
         bl = ((width*rlTrim), 0, (width/2), height)      # 左ページ
         # 右ページトリミング
         new_pr = img.crop(br)
-        if os.path.splitext(p)[1] == '.png':
+        if Path(p).suffix == '.png':
             new_pr = new_pr.convert('RGB')
-        new_pr_name = os.path.splitext(p)[0] + '_1.jpg'
-        new_pr.save(os.path.join(new_img_path, new_pr_name))
+        new_pr_name = Path(p).stem + '_1.jpg'
+        new_pr.save(new_img_path.joinpath(new_pr_name))
         # 左ページトリミング
         new_pl = img.crop(bl)
-        if os.path.splitext(p)[1] == '.png':
+        if Path(p).suffix == '.png':
             new_pl = new_pl.convert('RGB')
-        new_pl_name = os.path.splitext(p)[0] + '_2.jpg'
-        new_pl.save(os.path.join(new_img_path, new_pl_name))
+        new_pl_name = Path(p).stem + '_2.jpg'
+        new_pl.save(new_img_path.joinpath(new_pl_name))
     logging.debug('end_proc')
 
 # jpg への変換関数
 def png_conv(p):
     logging.debug('start_proc')
-    with Image.open(os.path.join(tpath, os.path.basename(p))) as conv_image:
+    with Image.open(tpath.joinpath(p)) as conv_image:
         conv_image = conv_image.convert('RGB')
-        conv_image.save(os.path.join(new_img_path, os.path.splitext(os.path.basename(p))[0] + '.jpg'))
+        conv_image.save(new_img_path.joinpath(Path(p).with_suffix('.jpg')))
     logging.debug('end_proc')
 
 # 余白の自動検出
 def mergin(pic, pos):
-    # openCVは2バイト文字を扱えないので、pillowで読み込み閾値の算出にのみopenCVを利用する。
+    # openCVは2バイト文字を扱えないので、pillowで読み込む
     with Image.open(pic) as img0:
         # 画像サイズ取得
         width, height = img0.size
-        # グレースケールに変換
-        img_gray = img0.convert('L')
-    # 座標(0,0)の階調を取得(グレースケールなので1ch)
-    g = img_gray.getpixel((0,0))
-    # numPyに突っ込みopenCVで扱えるndarrayにする。
-    img_n = np.array(img_gray)
-    # 閾値の算出(大津メソッド)
-    threshold, _ = cv2.threshold(img_n, 0, 255, cv2.THRESH_OTSU)
-    # watermark避けで画像の上2/3だけ採用
-    img_n = img_n[0:height*2//3, 0:width] 
-    # 閾値より大きければ余白は'白'、小さければ'黒'と判定し、
-    # 余白が白なら黒の最小・最大x座標を、黒なら白の最小・最大x座標を求める。
-    if g >= threshold:   # 余白は白
-        coord = np.where(img_n < threshold)   #黒部分の座標を求める
-    elif g < threshold:  # 余白は黒
-        coord = np.where(img_n >= threshold)  #白部分の座標を求める
+        # 座標(0,0)の色を取得
+        r, g, b = img0.getpixel((0,0))
+        # openCVで扱えるndarrayにする。
+        img_np = np.array(img0)
+    # watermark避けで画像の上2/3だけスライス
+    img_np = img_np[0:height*2//3, 0:width]
+    # cv2で扱うのでBGR空間に変換
+    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    # 座標(0,0)の色±10の範囲を255(白)にそれ以外を0(黒)に2値化する
+    img_np = cv2.inRange(img_np, np.array([b-10, g-10, r-10]), np.array([b+10, g+10, r+10]))
+    # 余白(白)以外(黒)の座標を求める
+    coord = np.where(img_np == 0)
+    # 黒部分のx座標の最小値と最大値を求める
     coord_min = min(coord[1])
     coord_max = max(coord[1])
     # 表紙の余白座標から、余白のトリミング量を計算
@@ -73,8 +73,6 @@ def mergin(pic, pos):
         rlTrim = coord_min / width
     elif pos == 'r':
         rlTrim = (width - coord_max) / width
-    else:
-        pass
     # トリム量を返す
     return rlTrim
 
@@ -82,21 +80,19 @@ def mergin(pic, pos):
 if __name__ == '__main__':
 
     # iniファイルから設定値読み込み
-    inipath = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'w-split.ini')
+    inipath = Path(sys.argv[0]).parent.joinpath('w-split.ini')
     ini = configparser.ConfigParser()
-    if os.path.isfile(inipath):
+    if inipath.exists():
         ini.read(inipath, 'UTF-8')
         # 画像の再確認
         confirm = int(ini['global']['confirm'])
         # 7zipの場所
         z7 = ini['global']['7zpass']
-        if not os.path.isfile(z7):
+        if not Path(z7).exists:
             print('7zipがありません')
             sys.exit()
     else:
         print('w-split.ini を w-split.exe と同じフォルダーにおいてください')
-        input()
-        sys.exit()
 
     # 処理ファイル名を引数から受け取り
     files = sys.argv
@@ -108,28 +104,33 @@ if __name__ == '__main__':
         sys.exit()
 
     for file in files[1:]:
+        file_name = Path(file)
 
-        print(os.path.basename(file) + ' 処理中...')
+        print(file_name.name + ' 処理中...')
 
         # 作業用一時フォルダの作成
-        with tempfile.TemporaryDirectory() as tempdir:
-
-            # 処理対象がファイルのときの処理
-            if os.path.isfile(file):
+        with tempfile.TemporaryDirectory() as temp:
+            tempdir = Path(temp)
 
             # ファイル名、パス名の定義
-                fname = os.path.splitext(os.path.basename(file))[0]     # 元ファイル名、拡張子なし
-                path = os.path.dirname(file)                            # 元ファイルのあるフォルダ名
-                ppath = os.path.join(path, fname)                       # 新しいフォルダ名
-                tpath = os.path.join(tempdir, fname)                    # 作業用一時フォルダ名
+            if file_name.is_file():
+                fname = file_name.stem      # 元ファイル名、拡張子なし
+            else:
+                fname = file_name.name      # 元フォルダ名
+            path = file_name.parent         # 元ファイルのあるフォルダ名
+            ppath = path.joinpath(fname)    # 新しいフォルダ名
+            tpath = tempdir.joinpath(fname) # 作業用一時フォルダ名
+
+            # 処理対象がファイルのときの処理
+            if file_name.is_file():
 
                 # 解凍先フォルダの作成
-                if not os.path.isdir(tpath):
+                if not tpath.exists():
                     os.makedirs(tpath)
 
                 # 7zipで書庫展開(フォルダ構造なし、フラット展開)
                 print('書庫展開中...')
-                subprocess.run([z7, 'e', file, '-y', '-bd', '-o' + tpath], stdout=subprocess.DEVNULL)
+                subprocess.run([z7, 'e', file, '-y', '-bd', '-o' + str(tpath)], stdout=subprocess.DEVNULL)
                 # フォルダーを検索
                 list_dirs = next(os.walk(tpath))[1]
                 # サブフォルダが複数あったらエラー
@@ -144,29 +145,21 @@ if __name__ == '__main__':
                     fname = list_dirs[0]
 
             # 処理対象がフォルダのときの処理
-            elif os.path.isdir(file):
-
-                # ファイル名、パス名の定義
-                fname = os.path.basename(file)                          # 元フォルダ名
-                path = os.path.dirname(file)                            # 元ファイルのあるフォルダ名
-                ppath = file                                            # 新しいフォルダ名
-                tpath = os.path.join(tempdir, fname)                    # 作業用一時フォルダ名
-
+            else:
                 # 一時作業フォルダに全ファイルをコピー
-                os.mkdir(tpath)
-                pic_files = os.listdir(file)
+                tpath.mkdir()
+                pic_files = file_name.glob('*.*')
                 for pic_file in pic_files:
-                    shutil.copy(os.path.join(file, pic_file), tpath)
+                    shutil.copy(file_name.joinpath(pic_file), tpath)
 
             # これ以降ファイル、フォルダ共通処理
 
             # ファイル名の置換。なぜか100ページ以降"_"が"-"になってるファイル対策
             # 大文字→小文字置換。なぜか100ページ以降一部大文字になってるファイル対策
             for f in next(os.walk(tpath))[2]:
-                f_old = os.path.join(tpath, f)
+                f_old = tpath.joinpath(f)
                 f_new = f.replace('-', '_').lower()
-                newname = os.path.join(tpath, f_new)
-                os.rename(f_old, newname)
+                f_old.rename(tpath.joinpath(f_new))
 
             list_files = next(os.walk(tpath))[2]
             # 二重書庫チェック
@@ -182,16 +175,13 @@ if __name__ == '__main__':
                 # 削除対象ファイルの削除
                 ext = ini['global']['ExcludeFile']
                 if re.search(ext, f):
-                    os.remove(os.path.join(tpath, f))
+                    os.remove(tpath.joinpath(f))
                     print(f + ' を削除')
                 # cover のリネーム
-                if os.path.splitext(os.path.basename(f))[0] == 'cover':
-                    cover = os.path.join(tpath, '00000' + os.path.splitext(f)[1])
-                    if not os.path.isfile(cover):
-                        os.rename(os.path.join(tpath, f), cover)
+                if Path(f).stem == 'cover':
+                    tpath.joinpath(f).rename(tpath.joinpath(f).with_stem('00000'))
 
             # 一時フォルダのファイルリスト
-
             all_pics = next(os.walk(tpath))[2]
 
             # windowsのexplorerライクソート
@@ -207,8 +197,8 @@ if __name__ == '__main__':
             isPage = False
             while not isPage:
                 try:
-                    tpage = int(input('表紙: 中央:1 / 右:2 / 左:3 / _*.*:4 / 置換:5 / 分割無:8 / スキップ:9 / 中断:0  ?:'))
-                    if tpage in [1, 2, 3, 4, 5, 8, 9, 0]:
+                    tpage = int(input('表紙: 中央:1 / 右:2 / 左:3 / _*.*:4 / net*.*:5 / 置換:6 / 分割無:8 / スキップ:9 / 中断:0  ?:'))
+                    if tpage in [1, 2, 3, 4, 5, 6, 8, 9, 0]:
                         isPage = True
                 except ValueError:
                     continue
@@ -216,7 +206,7 @@ if __name__ == '__main__':
                 continue
             elif tpage == 0:
                 sys.exit()
-            elif tpage in [4, 5]:
+            elif tpage in [4, 6]:
                 isPage = False
                 while not isPage:
                     try:
@@ -233,7 +223,7 @@ if __name__ == '__main__':
             all_pics = winsort(all_pics)
 
             # トリム量の決定
-            if tpage in [1, 2, 3, 4, 5]:
+            if tpage in [1, 2, 3, 4, 6]:
                 isNum = False
                 while not isNum:
                     try:
@@ -242,23 +232,25 @@ if __name__ == '__main__':
                             isNum = True
                     except ValueError:
                         continue
-            if tpage == 9:
-                continue
-            elif tpage == 0:
-                sys.exit()
-            else:
-                pass
+                if trim == 9:
+                    continue
+                elif trim == 0:
+                    sys.exit()
+                else:
+                    pass
+            elif tpage == 5:
+                trim = 2
 
             if not tpage == 8:
                 if trim == 1:
                     if tpage == 1 or tpage2 == 1:   # 表紙中央
-                        rlTrim = mergin(os.path.join(tpath, all_pics[0]), 'c')
+                        rlTrim = mergin(tpath.joinpath(all_pics[0]), 'c')
                         print('トリミング量: {:.2f}%'.format(rlTrim * 100))
                     elif tpage == 2 or tpage2 == 2: # 表紙右
-                        rlTrim = mergin(os.path.join(tpath, all_pics[0]), 'r')
+                        rlTrim = mergin(tpath.joinpath(all_pics[0]), 'r')
                         print('トリミング量: {:.2f}%'.format(rlTrim * 100))
                     else:                           # 表紙左
-                        rlTrim = mergin(os.path.join(tpath, all_pics[0]), 'l')
+                        rlTrim = mergin(tpath.joinpath(all_pics[0]), 'l')
                         print('トリミング量: {:.2f}%'.format(rlTrim * 100))
                 elif trim == 3:
                     rlTrim = float(ini['global']['trim'])/100
@@ -273,15 +265,15 @@ if __name__ == '__main__':
                     continue
 
             # トリミングした画像を保存するフォルダ
-            new_img_path = os.path.join(tpath, 'trim', 'pics')
+            new_img_path = tpath.joinpath('trim', 'pics')
             #もし存在しなければ作る
-            if not os.path.isdir(new_img_path):
+            if not new_img_path.exists():
                 os.makedirs(new_img_path)
             
             # 分割なしならただ移動、png,avifはjpgに変換、画像確認はなし
             if tpage == 8:
-                cov_pics = glob.glob(glob.escape(tpath) + '/*.png') + glob.glob(glob.escape(tpath) + '/*.avif')
-                cov_pics = [os.path.basename(f) for f in cov_pics]
+                cov_pics = list(tpath.glob('*.png')) + list(tpath.glob('*.avif'))
+                cov_pics = [Path(f).name for f in cov_pics]
                 jpg_pics = list(set(all_pics) - set(cov_pics))
                 if len(cov_pics) != 0:
                     print('画像変換中...')
@@ -290,16 +282,16 @@ if __name__ == '__main__':
                         result = executor.map(png_conv, cov_pics)
                 if len(jpg_pics) != 0:
                     for jpg in jpg_pics:
-                        shutil.move(os.path.join(tpath, jpg), new_img_path)
+                        shutil.move(tpath.joinpath(jpg), new_img_path)
 
             # 先頭のみ分割の場合、分割対象を(_*.*)に絞り残りはコピー
             elif tpage == 4:
-                trim_pics = glob.glob(glob.escape(tpath) + '/_*.*')
-                trim_pics = [os.path.basename(p) for p in trim_pics]
+                trim_pics = tpath.glob('_*.*')
+                trim_pics = [Path(p).name for p in trim_pics]
                 if len(trim_pics) == 0:
                     print('_*.* ファイルがありません')
                     continue
-                with Image.open(os.path.join(tpath, trim_pics[0])) as img0:
+                with Image.open(tpath.joinpath(trim_pics[0])) as img0:
                     width, height = img0.size
                     if tpage2 == 1:      # 表紙センター
                         box = ((width*(2*rlTrim+1)/4), 0, (width*(1-(2*rlTrim+1)/4)), height)
@@ -308,16 +300,33 @@ if __name__ == '__main__':
                     elif tpage2 == 3:    # 表紙左ページ
                         box = ((width*rlTrim), 0, (width/2), height)
                     new_img_c = img0.crop(box)
-                    if os.path.splitext(trim_pics[0])[1] == '.png':
+                    if Path(trim_pics[0]).suffix == '.png':
                         new_img_c = new_img_c.convert('RGB')
-                    new_img_name_c = os.path.splitext(trim_pics[0])[0] + '_0.jpg'
-                    new_img_c.save(os.path.join(new_img_path, new_img_name_c))
+                    new_img_name_c = Path(trim_pics[0]).stem + '_0.jpg'
+                    new_img_c.save(new_img_path.joinpath(new_img_name_c))
                 with futures.ThreadPoolExecutor() as executor:
                     result = executor.map(page_crop, trim_pics[1:])
                 rest_pics = list(set(all_pics) - set(trim_pics))
                 if len(rest_pics) != 0:
                     for pic in rest_pics:
-                        shutil.move(os.path.join(tpath, pic), new_img_path)
+                        shutil.move(tpath.joinpath(pic), new_img_path)
+                if confirm != 0:
+                    subprocess.Popen(['explorer', new_img_path], shell=True)
+                    print('画像を確認後エクスプローラーを閉じてください')
+
+            # 後半のみ分割の場合、分割対象を(net*.*)に絞り残りはコピー
+            elif tpage == 5:
+                trim_pics = tpath.glob('net*.*')
+                trim_pics = [Path(p).name for p in trim_pics]
+                if len(trim_pics) == 0:
+                    print('net*.* ファイルがありません')
+                    continue
+                with futures.ThreadPoolExecutor() as executor:
+                    result = executor.map(page_crop, trim_pics)
+                rest_pics = list(set(all_pics) - set(trim_pics))
+                if len(rest_pics) != 0:
+                    for pic in rest_pics:
+                        shutil.move(tpath.joinpath(pic), new_img_path)
                 if confirm != 0:
                     subprocess.Popen(['explorer', new_img_path], shell=True)
                     print('画像を確認後エクスプローラーを閉じてください')
@@ -327,7 +336,7 @@ if __name__ == '__main__':
                 start_time = time.perf_counter()
                 print('トリミング中...')
                 # 先頭ページトリミング
-                with Image.open(os.path.join(tpath, all_pics[0])) as img0:
+                with Image.open(tpath.joinpath(all_pics[0])) as img0:
                     width, height = img0.size
                     if tpage == 1:      # 表紙センター
                         box = ((width*(2*rlTrim+1)/4), 0, (width*(1-(2*rlTrim+1)/4)), height)
@@ -337,10 +346,10 @@ if __name__ == '__main__':
                         box = ((width*rlTrim), 0, (width/2), height)
     
                     new_img_c = img0.crop(box)
-                    if os.path.splitext(all_pics[0])[1] == '.png':
+                    if Path(all_pics[0]).suffix == '.png':
                         new_img_c = new_img_c.convert('RGB')
-                    new_img_name_c = os.path.splitext(all_pics[0])[0] + '_0.jpg'
-                    new_img_c.save(os.path.join(new_img_path, new_img_name_c))
+                    new_img_name_c = Path(all_pics[0]).stem + '_0.jpg'
+                    new_img_c.save(new_img_path.joinpath(new_img_name_c))
 
                 # 2ページ以降トリミング、平行処理
                 with futures.ThreadPoolExecutor() as executor:
@@ -356,10 +365,10 @@ if __name__ == '__main__':
                     print('画像を確認後エクスプローラーを閉じてください')
 
             # 分割元画像との置換の場合
-            elif tpage == 5:
+            elif tpage == 6:
                 # 分割対象のリスト
                 pic_files = os.listdir(file)
-                with Image.open(os.path.join(tpath, pic_files[0])) as img0:
+                with Image.open(tpath.joinpath(pic_files[0])) as img0:
                     width, height = img0.size
                     if tpage2 == 1:      # 表紙センター
                         box = ((width*(2*rlTrim+1)/4), 0, (width*(1-(2*rlTrim+1)/4)), height)
@@ -369,21 +378,21 @@ if __name__ == '__main__':
                         box = ((width*rlTrim), 0, (width/2), height)
     
                     new_img_c = img0.crop(box)
-                    if os.path.splitext(all_pics[0])[1] == '.png':
+                    if Path(all_pics[0]).suffix == '.png':
                         new_img_c = new_img_c.convert('RGB')
-                    new_img_name_c = os.path.splitext(all_pics[0])[0] + '_0.jpg'
-                    new_img_c.save(os.path.join(new_img_path, new_img_name_c))
+                    new_img_name_c = Path(all_pics[0]).stem + '_0.jpg'
+                    new_img_c.save(new_img_path.joinpath(new_img_name_c))
 
                 # 2ページ以降トリミング、平行処理
                 with futures.ThreadPoolExecutor() as executor:
                     result = executor.map(page_crop, pic_files[1:])
                 # 元画像を削除
                 for pic_file in pic_files:
-                    send2trash(os.path.join(file, pic_file))
+                    send2trash(file_name.joinpath(pic_file))
                 # トリミング画像を元フォルダにコピー
                 new_pics = os.listdir(new_img_path)
                 for pic in new_pics:
-                    shutil.copy(os.path.join(new_img_path, pic), os.path.splitext(file)[0])
+                    shutil.copy(new_img_path.joinpath(pic), file_name)
                 continue
 
             else:
@@ -406,29 +415,36 @@ if __name__ == '__main__':
             new_pics = winsort(os.listdir(new_img_path))
             i = 0
             for pic in new_pics:
-                # 数値を三桁(000)形式にそろえる
                 zero_i = '{0:03d}'.format(i)
-                num_name = zero_i + os.path.splitext(pic)[1]
-                num_name = os.path.join(new_img_path, num_name)
-                old_name = os.path.join(new_img_path, pic)
-                os.rename(old_name, num_name)
+                new_img_path.joinpath(pic).rename(new_img_path.joinpath(str(zero_i) + '_' + pic))
+                i += 1
+            # 数値を三桁(000)形式にそろえる
+            new_pics = winsort(os.listdir(new_img_path))
+            i = 0
+            for pic in new_pics:
+                zero_i = '{0:03d}'.format(i)
+                new_img_path.joinpath(pic).rename(new_img_path.joinpath(Path(pic).with_stem(zero_i)))
                 i += 1
 
             # フォルダ削除、trimフォルダリネーム
-            if os.path.isdir(os.path.join(tpath, 'trim', fname)):
-                shutil.rmtree(os.path.join(tpath, 'trim', fname))
-            os.rename(new_img_path, (os.path.join(tpath, 'trim', fname)))
+            if tpath.joinpath('trim', fname).is_dir():
+                shutil.rmtree(tpath.joinpath('trim', fname))
+            new_img_path = new_img_path.rename(tpath.joinpath('trim', fname))
 
             # 元ファイルはゴミ箱に
-            if os.path.isfile(file):
+            if file_name.is_file():
                 send2trash(file)
 
             # zip書庫に圧縮
             print('書庫圧縮中...')
-            zip_name = os.path.join(path, fname)
-            zip_dir = os.path.join(tpath, 'trim', fname)
+            zip_name = path.joinpath(fname)
+            zip_dir = tpath.joinpath('trim', fname)
             subprocess.run([z7, 'a', '-tzip', zip_name, zip_dir], stdout=subprocess.DEVNULL)
-#            shutil.make_archive(os.path.join(path, fname), format='zip', root_dir=os.path.join(tpath, 'trim'), base_dir=fname)
+#            shutil.make_archive(path.joinpath(fname), format='zip', root_dir=tpath.joinpath('trim'), base_dir=fname)
+
+            # ファイル名に"."があると拡張子".zip"が付かないときの対策(7zipのバグ??)
+            if not os.path.isfile(str(path.joinpath(fname)) + '.zip'):
+                path.joinpath(fname).rename(str(path.joinpath(fname)) + '.zip')
 
             # ファイル名整形、付加
             if kakunin == 1:
@@ -437,31 +453,29 @@ if __name__ == '__main__':
                 add = '(少女漫画) '
             else:
                 add = ''
-            new_name = re.sub('^\(.*\) ', '', os.path.basename(fname))
+            new_name = re.sub('^\(.*\) ', '', str(fname))
             new_name = add + new_name + '.zip'
             # 文字列の正規化
             new_name = unicodedata.normalize('NFKC', new_name)
             # 文字列の置換
             new_name = re.sub(r'\[[^\]]*\]', lambda m: m[0].replace('x', '×'), new_name)
-            new_name = new_name.replace('_', ' ').replace('!', '！').replace(':', '：').replace('/', '／').replace('?', '？').replace('<', '＜').replace('>', '＞').replace('~', '～').replace('卷', '巻')
+            # Windowsファイル名のダメ文字を置換
+            new_name = damemoji(new_name)
+            # その他置換ルール
+            new_name = new_name.replace('_', ' ').replace('!', '！').replace('&', '＆').replace('~', '～').replace('...', '…').replace('卷', '巻')
 
-            if not os.path.isfile(new_name):
-                try:
-                    os.chdir(path)
-                    os.rename(fname + '.zip', new_name)
-                except Exception as e:
-                    print(e)
+            if not path.joinpath(new_name).exists():
+                os.rename(str(path.joinpath(fname)) + '.zip', path.joinpath(new_name))
             else:
                 print('同名ファイルが存在しています')
 
-        os.chdir(path)
-        if os.path.isdir(file):
+        if file_name.is_dir():
             try:
                 send2trash(file)
             except Exception:
-                time.sleep(0.1)
-#                shutil.rmtree(file)
-                subprocess.run('cmd /c rmdir /s /q "' + file + '"')
+                shutil.rmtree(file, ignore_errors=True)
+                if file_name.exists():
+                    subprocess.run('cmd /c rmdir /s /q "' + file + '"')
         print('')
 
     else:
